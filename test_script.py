@@ -310,6 +310,8 @@ def main():
             print("File path cannot be empty. Please try again.")
             continue
         
+        # Remove surrounding quotes if present
+        csv_path_input = csv_path_input.strip('"').strip("'")
         csv_path = Path(csv_path_input)
         
         # Step 2: Load file with error handling
@@ -359,17 +361,18 @@ def main():
         for _, row in summary.iterrows():
             print(f"{str(row['level']):<20} {str(row['measurement']):<35} {row['noise']:<15.2f}")
     
-    # Step 6: Input - Target MSR (with double confirmation for exit)
+    # Step 6: Input - Hysteresis values for P-core and E-core
     skip_count = 0
     while skip_count < 2:
-        target_msr = input("\nEnter target MSR register (hex, e.g. 0x1b, or press Enter to skip): ").strip()
+        print("\n--- Set Hysteresis Values ---")
+        pcore_value_input = input("P-core value (decimal ms, or press Enter to skip): ").strip()
         
-        if not target_msr:
+        if not pcore_value_input:
             skip_count += 1
             if skip_count == 1:
-                confirm = input("Press Enter again to exit, or type MSR address: ").strip()
+                confirm = input("Press Enter again to exit, or enter P-core value: ").strip()
                 if confirm:
-                    target_msr = confirm
+                    pcore_value_input = confirm
                     skip_count = 0  # Reset since user provided input
                 else:
                     print("Exiting.")
@@ -378,21 +381,96 @@ def main():
                 print("Exiting.")
                 sys.exit(0)
         
-        if target_msr:
-            # Step 7: Write into MSR
-            target_value = input("Enter value to write (hex): ").strip()
+        if pcore_value_input:
+            ecore_value_input = input("E-core value (decimal ms): ").strip()
             
-            if not target_value:
-                print("No value provided. Skipping write.")
+            if not ecore_value_input:
+                print("No E-core value provided. Skipping write.")
                 continue
             
-            print(f"\nWriting {target_value} to MSR {target_msr}...")
-            result = write_msr(target_msr, target_value)
-            print(f"Write result: {result}")
-            
-            # Read back the value
-            current_msr = read_msr(target_msr)
-            print(f"MSR {target_msr} current value: {current_msr}")
+            try:
+                # Convert decimal ms to hex
+                pcore_ms = int(pcore_value_input)
+                ecore_ms = int(ecore_value_input)
+                pcore_hex = hex(pcore_ms)
+                ecore_hex = hex(ecore_ms)
+                
+                print(f"\n=== Setting P-core Hysteresis to {pcore_ms} ms ({pcore_hex}) ===")
+                
+                # P-core sequence
+                print("\n1. Reading MSR 0x607 (control register)...")
+                result = read_msr("0x607")
+                print(f"   Value: {result}")
+                
+                print("\n2. Getting current P-core hysteresis value...")
+                result = write_msr("0x607", "0x8000010A")
+                print(f"   {result}")
+                
+                print("\n3. Reading MSR 0x608 (current P-core hysteresis)...")
+                pcore_old = read_msr("0x608")
+                print(f"   Current value: {pcore_old}")
+                
+                print(f"\n4. Writing new P-core hysteresis value ({pcore_hex})...")
+                result = write_msr("0x608", pcore_hex)
+                print(f"   {result}")
+                
+                print("\n5. Setting new P-core hysteresis value...")
+                result = write_msr("0x607", "0x8000000A")
+                print(f"   {result}")
+                
+                print("\n6. Verifying new P-core hysteresis value...")
+                result = write_msr("0x607", "0x8000010A")
+                print(f"   {result}")
+                
+                print("\n7. Reading MSR 0x608 (verify P-core hysteresis)...")
+                pcore_new = read_msr("0x608")
+                print(f"   New value: {pcore_new}")
+                
+                print(f"\n=== Setting E-core Hysteresis to {ecore_ms} ms ({ecore_hex}) ===")
+                
+                # E-core sequence
+                print("\n1. Reading MSR 0x607 (control register)...")
+                result = read_msr("0x607")
+                print(f"   Value: {result}")
+                
+                print("\n2. Getting current E-core hysteresis value...")
+                result = write_msr("0x607", "0x8001010A")
+                print(f"   {result}")
+                
+                print("\n3. Reading MSR 0x608 (current E-core hysteresis)...")
+                ecore_old = read_msr("0x608")
+                print(f"   Current value: {ecore_old}")
+                
+                print(f"\n4. Writing new E-core hysteresis value ({ecore_hex})...")
+                result = write_msr("0x608", ecore_hex)
+                print(f"   {result}")
+                
+                print("\n5. Setting new E-core hysteresis value...")
+                result = write_msr("0x607", "0x8001000A")
+                print(f"   {result}")
+                
+                print("\n6. Verifying new E-core hysteresis value...")
+                result = write_msr("0x607", "0x8001010A")
+                print(f"   {result}")
+                
+                print("\n7. Reading MSR 0x608 (verify E-core hysteresis)...")
+                ecore_new = read_msr("0x608")
+                print(f"   New value: {ecore_new}")
+                
+                # Summary
+                print("\n" + "=" * 70)
+                print("SUMMARY:")
+                print(f"P-core: {pcore_old} → {pcore_new} (target: {pcore_hex} / {pcore_ms} ms)")
+                print(f"E-core: {ecore_old} → {ecore_new} (target: {ecore_hex} / {ecore_ms} ms)")
+                print("=" * 70)
+                
+                # Use the new values for logging
+                target_msr = "0x607/0x608 (Hysteresis)"
+                current_msr = f"P-core: {pcore_new}, E-core: {ecore_new}"
+                
+            except ValueError:
+                print("✗ Invalid input. Please enter numeric values for milliseconds.")
+                continue
             
             # Get next log ID
             log_id = get_next_log_id(args.log)
@@ -440,6 +518,8 @@ def main():
                     print("File path cannot be empty. Please try again.")
                     continue
                 
+                # Remove surrounding quotes if present
+                csv_path_input = csv_path_input.strip('"').strip("'")
                 csv_path = Path(csv_path_input)
                 
                 try:
