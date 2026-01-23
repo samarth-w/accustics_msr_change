@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import subprocess
 import sys
+from typing import Optional
 
 #!/usr/bin/env python3
 
@@ -12,6 +13,7 @@ def check_and_install_dependencies():
     required_packages = {
         'pandas': 'pandas',
         'openpyxl': 'openpyxl',  # For Excel support
+        'matplotlib': 'matplotlib',  # For plotting
     }
     
     missing_packages = []
@@ -50,10 +52,19 @@ def check_and_install_dependencies():
             sys.exit(1)
 
 # Run dependency check
-check_and_install_dependencies()
+check_and_install_dependencies()    
 
 # Import pandas after checking dependencies
 import pandas as pd
+
+# Plotting (Tkinter + Matplotlib)
+import tkinter as tk
+from tkinter import ttk
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 
@@ -77,6 +88,178 @@ OUTLIER_COLUMNS = [
 CORE_BIT_MAP = {"pcore": "0", "ecore": "1"}
 HYSTERESIS_REGISTER = "0x608"
 HYSTERESIS_CONTROL_REGISTER = "0x607"
+
+FREQUENCY_LABELS = [
+    "12.5 Hz",
+    "16 Hz",
+    "20 Hz",
+    "25 Hz",
+    "31.5 Hz",
+    "40 Hz",
+    "50 Hz",
+    "63 Hz",
+    "80 Hz",
+    "100 Hz",
+    "125 Hz",
+    "160 Hz",
+    "200 Hz",
+    "250 Hz",
+    "315 Hz",
+    "400 Hz",
+    "500 Hz",
+    "630 Hz",
+    "800 Hz",
+    "1 kHz",
+    "1.25 kHz",
+    "1.6 kHz",
+    "2 kHz",
+    "2.5 kHz",
+    "3.15 kHz",
+    "4 kHz",
+    "5 kHz",
+    "6.3 kHz",
+    "8 kHz",
+    "10 kHz",
+    "12.5 kHz",
+    "16 kHz",
+    "20 kHz",
+]
+
+
+def parse_frequency(value: object) -> Optional[float]:
+    """Parse frequency labels like '12.5 Hz', '1 kHz', ignoring A/Z."""
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.upper() in {"A", "Z"}:
+        return None
+    normalized = text.replace(" ", "").lower()
+    try:
+        if normalized.endswith("khz"):
+            return float(normalized[:-3]) * 1000
+        if normalized.endswith("hz"):
+            return float(normalized[:-2])
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+class PlotWindow:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Noise vs Frequency (Iterative)")
+
+        self.mode_var = tk.StringVar(value="current_prev")
+        self.data_runs: list[dict[str, object]] = []
+        self.frequency_index = {
+            label.lower().replace(" ", ""): idx for idx, label in enumerate(FREQUENCY_LABELS)
+        }
+
+        controls = ttk.LabelFrame(self.root, text="View")
+        controls.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Radiobutton(
+            controls,
+            text="Current vs Previous",
+            value="current_prev",
+            variable=self.mode_var,
+            command=self.update_plot,
+        ).pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Radiobutton(
+            controls,
+            text="Last 5 runs",
+            value="last_5",
+            variable=self.mode_var,
+            command=self.update_plot,
+        ).pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Radiobutton(
+            controls,
+            text="All runs",
+            value="all",
+            variable=self.mode_var,
+            command=self.update_plot,
+        ).pack(side=tk.LEFT, padx=10, pady=5)
+
+        self.figure = Figure(figsize=(9, 5), dpi=100)
+        self.ax = self.figure.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def add_run(self, run_label: str, df: pd.DataFrame, threshold: float) -> None:
+        series = self._extract_series(df)
+        if not series:
+            return
+        self.data_runs.append({"label": run_label, "series": series, "threshold": threshold})
+        self.update_plot()
+
+    def _extract_series(self, df: pd.DataFrame) -> list[tuple[int, str, float]]:
+        if "level" not in df.columns:
+            return []
+        numeric_cols = [
+            col for col in df.columns if col != "level" and df[col].dtype in ["float64", "int64"]
+        ]
+        if not numeric_cols:
+            return []
+        noise_col = numeric_cols[0]
+        series: list[tuple[int, str, float]] = []
+        for _, row in df.iterrows():
+            label = str(row["level"]).strip()
+            normalized = label.lower().replace(" ", "")
+            if normalized in {"a", "z"}:
+                continue
+            idx = self.frequency_index.get(normalized)
+            if idx is None:
+                continue
+            noise = row[noise_col]
+            if pd.notna(noise):
+                series.append((idx, label, float(noise)))
+        series.sort(key=lambda item: item[0])
+        return series
+
+    def _select_runs(self) -> list[dict[str, object]]:
+        if not self.data_runs:
+            return []
+        mode = self.mode_var.get()
+        if mode == "current_prev":
+            return self.data_runs[-2:] if len(self.data_runs) >= 2 else self.data_runs[-1:]
+        if mode == "last_5":
+            return self.data_runs[-5:]
+        return self.data_runs
+
+    def update_plot(self) -> None:
+        self.ax.clear()
+        selected_runs = self._select_runs()
+        for run in selected_runs:
+            label = run["label"]
+            series = run["series"]
+            x_vals = [item[0] for item in series]
+            y_vals = [item[2] for item in series]
+            self.ax.plot(x_vals, y_vals, marker="o", label=str(label))
+
+        if selected_runs:
+            latest_threshold = selected_runs[-1].get("threshold")
+            if isinstance(latest_threshold, (int, float)):
+                self.ax.axhline(
+                    y=float(latest_threshold),
+                    color="red",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label=f"Threshold ({latest_threshold})",
+                )
+
+        self.ax.set_xlabel("Frequency")
+        self.ax.set_ylabel("Noise (dB)")
+        self.ax.set_ylim(-25, 15)
+        self.ax.set_xticks(range(len(FREQUENCY_LABELS)))
+        self.ax.set_xticklabels(FREQUENCY_LABELS, rotation=45, ha="right")
+        if selected_runs:
+            self.ax.legend()
+        self.ax.grid(True, linestyle="--", alpha=0.5)
+        self.canvas.draw()
+        self.root.update_idletasks()
+        self.root.update()
 
 
 def load_csv(path: Path) -> pd.DataFrame:
@@ -106,7 +289,8 @@ def load_csv(path: Path) -> pd.DataFrame:
         # Convert numeric columns to proper numeric type
         for col in df.columns:
             if col != 'level':
-                df[col] = pd.to_numeric(df[col], errors='ignore')
+                converted = pd.to_numeric(df[col], errors='coerce')
+                df[col] = converted.where(converted.notna(), df[col])
         
         return df
     except FileNotFoundError:
@@ -294,6 +478,37 @@ def set_hysteresis_sequence(core: str, hysteresis_value: str) -> dict[str, str]:
     return results
 
 
+def preload_runs(plot_window: PlotWindow, log_path: Path) -> int:
+    """Load prior runs from log file to restore plot context."""
+    if not log_path.exists():
+        return 0
+    try:
+        df_logs = pd.read_csv(log_path)
+    except Exception:
+        return 0
+    if df_logs.empty:
+        return 0
+
+    loaded = 0
+    for _, row in df_logs.iterrows():
+        details_path = str(row.get("details_path", "")).strip()
+        if not details_path:
+            continue
+        try:
+            run_df = load_csv(Path(details_path))
+        except Exception:
+            continue
+        threshold_value = row.get("threshold")
+        try:
+            threshold_value = float(threshold_value)
+        except (TypeError, ValueError):
+            threshold_value = 0.0
+        label = f"Run {int(row.get('log_id', loaded + 1))}"
+        plot_window.add_run(label, run_df, threshold_value)
+        loaded += 1
+    return loaded
+
+
 def main():
     parser = argparse.ArgumentParser(description="MSR outlier analyzer")
     parser.add_argument("--log", type=Path, default=Path("msr_log.csv"), help="Log file to update")
@@ -302,6 +517,10 @@ def main():
     args = parser.parse_args()
 
     print("=== MSR Outlier Analyzer ===\n")
+
+    plot_window = PlotWindow()
+    loaded_runs = preload_runs(plot_window, args.log)
+    run_counter = loaded_runs + 1
     
     # Step 1: Input - Get CSV path dynamically
     while True:
@@ -360,6 +579,8 @@ def main():
         print("-" * 70)
         for _, row in summary.iterrows():
             print(f"{str(row['level']):<20} {str(row['measurement']):<35} {row['noise']:<15.2f}")
+
+    plot_window.add_run(f"Run {run_counter}", df, threshold)
     
     # Step 6: Input - Hysteresis values for P-core and E-core
     skip_count = 0
@@ -398,62 +619,60 @@ def main():
                 print(f"\n=== Setting P-core Hysteresis to {pcore_ms} ms ({pcore_hex}) ===")
                 
                 # P-core sequence
-                print("\n1. Reading MSR 0x607 (control register)...")
+                # Read MSR 0x607 (control register) - execute but don't display
                 result = read_msr("0x607")
-                print(f"   Value: {result}")
                 
-                print("\n2. Getting current P-core hysteresis value...")
+                print("\n1. Getting current P-core hysteresis value...")
                 result = write_msr("0x607", "0x8000010A")
                 print(f"   {result}")
                 
-                print("\n3. Reading MSR 0x608 (current P-core hysteresis)...")
+                print("\n2. Reading MSR 0x608 (current P-core hysteresis)...")
                 pcore_old = read_msr("0x608")
                 print(f"   Current value: {pcore_old}")
                 
-                print(f"\n4. Writing new P-core hysteresis value ({pcore_hex})...")
+                print(f"\n3. Writing new P-core hysteresis value ({pcore_hex})...")
                 result = write_msr("0x608", pcore_hex)
                 print(f"   {result}")
                 
-                print("\n5. Setting new P-core hysteresis value...")
+                print("\n4. Setting new P-core hysteresis value...")
                 result = write_msr("0x607", "0x8000000A")
                 print(f"   {result}")
                 
-                print("\n6. Verifying new P-core hysteresis value...")
+                print("\n5. Verifying new P-core hysteresis value...")
                 result = write_msr("0x607", "0x8000010A")
                 print(f"   {result}")
                 
-                print("\n7. Reading MSR 0x608 (verify P-core hysteresis)...")
+                print("\n6. Reading MSR 0x608 (verify P-core hysteresis)...")
                 pcore_new = read_msr("0x608")
                 print(f"   New value: {pcore_new}")
                 
                 print(f"\n=== Setting E-core Hysteresis to {ecore_ms} ms ({ecore_hex}) ===")
                 
                 # E-core sequence
-                print("\n1. Reading MSR 0x607 (control register)...")
+                # Read MSR 0x607 (control register) - execute but don't display
                 result = read_msr("0x607")
-                print(f"   Value: {result}")
                 
-                print("\n2. Getting current E-core hysteresis value...")
+                print("\n1. Getting current E-core hysteresis value...")
                 result = write_msr("0x607", "0x8001010A")
                 print(f"   {result}")
                 
-                print("\n3. Reading MSR 0x608 (current E-core hysteresis)...")
+                print("\n2. Reading MSR 0x608 (current E-core hysteresis)...")
                 ecore_old = read_msr("0x608")
                 print(f"   Current value: {ecore_old}")
                 
-                print(f"\n4. Writing new E-core hysteresis value ({ecore_hex})...")
+                print(f"\n3. Writing new E-core hysteresis value ({ecore_hex})...")
                 result = write_msr("0x608", ecore_hex)
                 print(f"   {result}")
                 
-                print("\n5. Setting new E-core hysteresis value...")
+                print("\n4. Setting new E-core hysteresis value...")
                 result = write_msr("0x607", "0x8001000A")
                 print(f"   {result}")
                 
-                print("\n6. Verifying new E-core hysteresis value...")
+                print("\n5. Verifying new E-core hysteresis value...")
                 result = write_msr("0x607", "0x8001010A")
                 print(f"   {result}")
                 
-                print("\n7. Reading MSR 0x608 (verify E-core hysteresis)...")
+                print("\n6. Reading MSR 0x608 (verify E-core hysteresis)...")
                 ecore_new = read_msr("0x608")
                 print(f"   New value: {ecore_new}")
                 
@@ -505,23 +724,33 @@ def main():
             # After writing MSR, ask if user wants to test with new configuration
             print("\n" + "=" * 70)
             print("MSR write completed. Test with new configuration?")
-            continue_choice = input("Load new acoustic data file? (y/n): ").strip().lower()
-            
-            if continue_choice != 'y':
+            continue_choice = input(
+                "Load new acoustic data file? (y/n or paste path): "
+            ).strip()
+
+            if not continue_choice:
                 print("\nExiting. Review outliers and run again if needed.")
                 sys.exit(0)
-            
+
+            if continue_choice.lower() == 'n':
+                print("\nExiting. Review outliers and run again if needed.")
+                sys.exit(0)
+
             # Load new file for next test
             while True:
-                csv_path_input = input("\nEnter new file path (.csv, .xlsx, .xls): ").strip()
+                if continue_choice.lower() == 'y':
+                    csv_path_input = input("\nEnter new file path (.csv, .xlsx, .xls): ").strip()
+                else:
+                    csv_path_input = continue_choice
+
                 if not csv_path_input:
                     print("File path cannot be empty. Please try again.")
                     continue
-                
+
                 # Remove surrounding quotes if present
                 csv_path_input = csv_path_input.strip('"').strip("'")
                 csv_path = Path(csv_path_input)
-                
+
                 try:
                     print(f"Loading file: {csv_path}")
                     df = load_csv(csv_path)
@@ -529,27 +758,17 @@ def main():
                     break
                 except FileNotFoundError as e:
                     print(f"✗ Error: {e}")
-                    retry = input("Try again? (y/n): ").strip().lower()
-                    if retry != 'y':
-                        print("Exiting.")
-                        sys.exit(0)
                 except (ValueError, Exception) as e:
                     print(f"✗ Error: {e}")
-                    retry = input("Try again? (y/n): ").strip().lower()
-                    if retry != 'y':
-                        print("Exiting.")
-                        sys.exit(0)
+
+                retry = input("Try again? (y/n): ").strip().lower()
+                if retry != 'y':
+                    print("Exiting.")
+                    sys.exit(0)
+                continue_choice = 'y'
             
-            # Get new threshold
-            while True:
-                threshold_input = input("\nEnter threshold value: ").strip()
-                try:
-                    threshold = float(threshold_input)
-                    break
-                except ValueError:
-                    print("✗ Invalid threshold. Please enter a numeric value.")
-            
-            print(f"Threshold set to: {threshold}")
+            # Reuse initial threshold for all runs
+            print(f"Using initial threshold: {threshold}")
             
             # Analyze new outliers
             print("\n--- Outlier Analysis (New Configuration) ---")
@@ -562,6 +781,9 @@ def main():
                 print("-" * 70)
                 for _, row in summary.iterrows():
                     print(f"{str(row['level']):<20} {str(row['measurement']):<35} {row['noise']:<15.2f}")
+
+            run_counter += 1
+            plot_window.add_run(f"Run {run_counter}", df, threshold)
             
             skip_count = 0  # Reset counter to continue loop
     
