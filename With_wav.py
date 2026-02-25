@@ -127,7 +127,6 @@ FREQUENCY_LABELS = [
     "20 kHz",
 ]
 
-
 def parse_frequency(value: object) -> Optional[float]:
     """Parse frequency labels like '12.5 Hz', '1 kHz', ignoring A/Z."""
     text = str(value).strip()
@@ -254,7 +253,6 @@ class PlotWindow:
 
         self.ax.set_xlabel("Frequency")
         self.ax.set_ylabel("Noise (dB)")
-        self.ax.set_ylim(-25, 15)
         self.ax.set_xticks(range(len(FREQUENCY_LABELS)))
         self.ax.set_xticklabels(FREQUENCY_LABELS, rotation=45, ha="right")
         if selected_runs:
@@ -337,13 +335,14 @@ def _calculate_spl(audio_data: np.ndarray, offset_db: float = 20.0) -> float:
     base_spl = 20 * np.log10(rms / 20e-6)
     return base_spl + offset_db
 
-def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> pd.DataFrame:
+def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> tuple[pd.DataFrame, Path]:
     """
     Convert a WAV file to a DataFrame with columns:
       level            – frequency label matching FREQUENCY_LABELS (e.g. '1 kHz')
       LAeq [dB]        – A-weighted SPL + calibration offset
 
     Also saves a CSV to wav2csv/<stem>_<timestamp>.csv.
+    Returns (df, out_csv).
     """
     sample_rate, audio_data = _load_audio(wav_path)
     print(f"  Sample rate : {sample_rate} Hz")
@@ -376,15 +375,16 @@ def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> pd.Dat
     df.rename(columns={"level": "Frequency"}).to_csv(out_csv, index=False)
     print(f"  ✓ WAV→CSV saved: {out_csv}")
 
-    return df
+    return df, out_csv
 
 
-def load_csv(path: Path) -> pd.DataFrame:
+def load_csv(path: Path) -> tuple[pd.DataFrame, Path]:
     try:
         # WAV file — route through audio analysis pipeline
         if path.suffix.lower() == '.wav':
             print(f"  Detected WAV file — running audio analysis...")
-            return wav_to_dataframe(path)
+            df, csv_path = wav_to_dataframe(path)
+            return df, csv_path
 
         # Check file extension
         if path.suffix.lower() in ['.xlsx', '.xls']:
@@ -414,7 +414,7 @@ def load_csv(path: Path) -> pd.DataFrame:
                 converted = pd.to_numeric(df[col], errors='coerce')
                 df[col] = converted.where(converted.notna(), df[col])
         
-        return df
+        return df, path
     except FileNotFoundError:
         raise FileNotFoundError(f"File not found: {path}")
     except pd.errors.EmptyDataError:
@@ -561,6 +561,40 @@ def save_formatted_log(formatted_log_path: Path, log_id: int, timestamp: str, ta
         f.write("\n")
 
 
+def log_session_results(
+    args,
+    log_id: int,
+    timestamp: str,
+    target_msr: str,
+    current_msr: str,
+    threshold: float,
+    resolved_path: Path,
+    summary: pd.DataFrame,
+) -> None:
+    """Append a log entry, outliers, and formatted log for one analysis run."""
+    entry = {
+        "log_id": log_id,
+        "timestamp": timestamp,
+        "target_msr": target_msr,
+        "threshold": threshold,
+        "current_msr_value": current_msr,
+        "details_path": str(resolved_path),
+    }
+    append_log(args.log, entry)
+    print(f"✓ Logged to {args.log} (ID: {log_id})")
+
+    if not summary.empty:
+        outliers_to_save = summary.copy()
+        outliers_to_save["log_id"] = log_id
+        outliers_to_save = outliers_to_save[["log_id", "level", "measurement", "noise"]]
+        append_outliers(args.outliers, outliers_to_save)
+        print(f"✓ Logged {len(outliers_to_save)} outliers to {args.outliers}")
+
+    save_formatted_log(args.formatted, log_id, timestamp, target_msr,
+                       current_msr, threshold, summary)
+    print(f"✓ Formatted log saved to {args.formatted}")
+
+
 def normalize_hex_value(value: str) -> str:
     if not value:
         raise ValueError("Empty hex value.")
@@ -616,8 +650,14 @@ def preload_runs(plot_window: PlotWindow, log_path: Path) -> int:
         details_path = str(row.get("details_path", "")).strip()
         if not details_path:
             continue
+        p = Path(details_path)
+        # If the logged path is a .wav, look for an already-converted CSV to avoid re-analysis
+        if p.suffix.lower() == '.wav':
+            matches = sorted(WAV2CSV_DIR.glob(p.stem + "_*.csv"))
+            if matches:
+                p = matches[-1]
         try:
-            run_df = load_csv(Path(details_path))
+            run_df, _ = load_csv(p)
         except Exception:
             continue
         threshold_value = row.get("threshold")
@@ -658,7 +698,7 @@ def main():
         # Step 2: Load file with error handling
         try:
             print(f"Loading file: {csv_path}")
-            df = load_csv(csv_path)
+            df, resolved_path = load_csv(csv_path)
             print(f"✓ Successfully loaded {len(df)} rows")
             break
         except FileNotFoundError as e:
@@ -703,7 +743,12 @@ def main():
             print(f"{str(row['level']):<20} {str(row['measurement']):<35} {row['noise']:<15.2f}")
 
     plot_window.add_run(f"Run {run_counter}", df, threshold)
-    
+
+    # Log initial run
+    log_id = get_next_log_id(args.log)
+    timestamp = datetime.utcnow().isoformat()
+    log_session_results(args, log_id, timestamp, "0x1b", current_msr, threshold, resolved_path, summary)
+
     # Step 6: Input - Hysteresis values for P-core and E-core
     skip_count = 0
     while skip_count < 2:
@@ -816,32 +861,10 @@ def main():
             # Get next log ID
             log_id = get_next_log_id(args.log)
             timestamp = datetime.utcnow().isoformat()
-            
-            # Log the main operation
-            entry = {
-                "log_id": log_id,
-                "timestamp": timestamp,
-                "target_msr": target_msr,
-                "threshold": threshold,
-                "current_msr_value": current_msr,
-                "details_path": str(csv_path),
-            }
-            append_log(args.log, entry)
-            print(f"✓ Logged to {args.log} (ID: {log_id})")
-            
-            # Log outliers to separate table
-            outliers_to_save = pd.DataFrame()
-            if not summary.empty:
-                outliers_to_save = summary.copy()
-                outliers_to_save["log_id"] = log_id
-                outliers_to_save = outliers_to_save[["log_id", "level", "measurement", "noise"]]
-                append_outliers(args.outliers, outliers_to_save)
-                print(f"✓ Logged {len(outliers_to_save)} outliers to {args.outliers}")
-            
-            # Save formatted log for better viewing
-            save_formatted_log(args.formatted, log_id, timestamp, target_msr, 
-                             current_msr, threshold, summary)
-            print(f"✓ Formatted log saved to {args.formatted}")
+
+            # Log hysteresis run using resolved_path so future preload finds the CSV
+            log_session_results(args, log_id, timestamp, target_msr, current_msr,
+                                threshold, resolved_path, summary)
             
             # After writing MSR, ask if user wants to test with new configuration
             print("\n" + "=" * 70)
@@ -875,7 +898,7 @@ def main():
 
                 try:
                     print(f"Loading file: {csv_path}")
-                    df = load_csv(csv_path)
+                    df, resolved_path = load_csv(csv_path)
                     print(f"✓ Successfully loaded {len(df)} rows")
                     break
                 except FileNotFoundError as e:
@@ -906,7 +929,13 @@ def main():
 
             run_counter += 1
             plot_window.add_run(f"Run {run_counter}", df, threshold)
-            
+
+            # Log iteration run
+            log_id = get_next_log_id(args.log)
+            timestamp = datetime.utcnow().isoformat()
+            log_session_results(args, log_id, timestamp, target_msr, current_msr,
+                                threshold, resolved_path, summary)
+
             skip_count = 0  # Reset counter to continue loop
     
     # Step 8: Exit
