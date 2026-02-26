@@ -161,6 +161,14 @@ class PlotWindow:
 
         ttk.Radiobutton(
             controls,
+            text="Current Run",
+            value="current",
+            variable=self.mode_var,
+            command=self.update_plot,
+        ).pack(side=tk.LEFT, padx=10, pady=5)
+
+        ttk.Radiobutton(
+            controls,
             text="Current vs Previous",
             value="current_prev",
             variable=self.mode_var,
@@ -224,6 +232,8 @@ class PlotWindow:
         if not self.data_runs:
             return []
         mode = self.mode_var.get()
+        if mode == "current":
+            return self.data_runs[-1:]
         if mode == "current_prev":
             return self.data_runs[-2:] if len(self.data_runs) >= 2 else self.data_runs[-1:]
         if mode == "last_5":
