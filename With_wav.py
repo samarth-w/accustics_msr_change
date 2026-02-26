@@ -150,7 +150,7 @@ class PlotWindow:
         self.root = tk.Tk()
         self.root.title("Noise vs Frequency (Iterative)")
 
-        self.mode_var = tk.StringVar(value="current_prev")
+        self.mode_var = tk.StringVar(value="only_current")
         self.data_runs: list[dict[str, object]] = []
         self.frequency_index = {
             label.lower().replace(" ", ""): idx for idx, label in enumerate(FREQUENCY_LABELS)
@@ -158,6 +158,14 @@ class PlotWindow:
 
         controls = ttk.LabelFrame(self.root, text="View")
         controls.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Radiobutton(
+            controls,
+            text="Only Current Run",
+            value="only_current",
+            variable=self.mode_var,
+            command=self.update_plot,
+        ).pack(side=tk.LEFT, padx=10, pady=5)
 
         ttk.Radiobutton(
             controls,
@@ -224,6 +232,8 @@ class PlotWindow:
         if not self.data_runs:
             return []
         mode = self.mode_var.get()
+        if mode == "only_current":
+            return self.data_runs[-1:]
         if mode == "current_prev":
             return self.data_runs[-2:] if len(self.data_runs) >= 2 else self.data_runs[-1:]
         if mode == "last_5":
