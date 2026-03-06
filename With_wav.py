@@ -271,6 +271,8 @@ import scipy.io.wavfile
 from scipy.signal import butter, filtfilt
 
 WAV2CSV_DIR = Path(__file__).parent / "wav2csv"
+IMAGES_DIR = Path(__file__).parent / "images"
+MAX_FREQ_RATIO = 0.4  # Upper frequency limit as a fraction of sample rate
 
 def _load_audio(file_path: Path):
     """Read WAV file and return (sample_rate, mono float32 audio)."""
@@ -278,7 +280,11 @@ def _load_audio(file_path: Path):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         sample_rate, audio_data = scipy.io.wavfile.read(str(file_path))
-    if audio_data.dtype == np.int16:
+    orig_dtype = audio_data.dtype
+    num_channels = audio_data.shape[1] if audio_data.ndim > 1 else 1
+    if audio_data.dtype == np.uint8:
+        audio_data = (audio_data.astype(np.float32) - 128.0) / 128.0
+    elif audio_data.dtype == np.int16:
         audio_data = audio_data.astype(np.float32) / 32768.0
     elif audio_data.dtype == np.int32:
         audio_data = audio_data.astype(np.float32) / 2147483648.0
@@ -286,6 +292,11 @@ def _load_audio(file_path: Path):
         audio_data = audio_data.astype(np.float32)
     if audio_data.ndim > 1:
         audio_data = np.mean(audio_data, axis=1)
+    duration = len(audio_data) / sample_rate
+    print(f"  Sample Rate : {sample_rate} Hz")
+    print(f"  Duration    : {duration:.2f} s")
+    print(f"  Channels    : {num_channels}")
+    print(f"  Bit depth   : {orig_dtype}")
     return sample_rate, audio_data
 
 def _get_third_octave_frequencies() -> np.ndarray:
@@ -295,16 +306,14 @@ def _get_third_octave_frequencies() -> np.ndarray:
         3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000
     ])
 
-def _third_octave_filter(audio_data: np.ndarray, sample_rate: int, center_freq: float) -> np.ndarray:
+def design_third_octave_filter(audio_data: np.ndarray, sample_rate: int, center_freq: float) -> np.ndarray:
     factor = 2 ** (1 / 6)
     f_lower = center_freq / factor
     f_upper = center_freq * factor
     nyquist = sample_rate / 2
     low = f_lower / nyquist
     high = f_upper / nyquist
-    if low <= 0:
-        low = 1e-4
-    if high >= 1.0:
+    if low <= 0 or low >= 1.0 or high >= 1.0 or low >= high:
         return np.zeros_like(audio_data)
     try:
         b, a = butter(4, [low, high], btype='band')
@@ -327,15 +336,15 @@ def _apply_a_weighting(audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
     weighted_fft = fft_data * a_response
     return np.real(np.fft.ifft(weighted_fft))
 
-def _calculate_spl(audio_data: np.ndarray, offset_db: float = 20.0) -> float:
-    """Return A-weighted SPL + calibration offset. Returns NaN on silence."""
+def calculate_spl_db20upa(audio_data: np.ndarray, calibration_offset: float = 118.0) -> float:
+    """Return A-weighted SPL using direct RMS-to-dBFS + calibration offset. Returns NaN on silence."""
     rms = np.sqrt(np.mean(audio_data ** 2))
     if rms <= 0 or not np.isfinite(rms):
         return float('nan')
-    base_spl = 20 * np.log10(rms / 20e-6)
-    return base_spl + offset_db
+    db_fs = 20 * np.log10(rms)
+    return db_fs + calibration_offset
 
-def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> tuple[pd.DataFrame, Path]:
+def wav_to_dataframe(wav_path: Path, calibration_offset: float = 118.0) -> tuple[pd.DataFrame, Path]:
     """
     Convert a WAV file to a DataFrame with columns:
       level            – frequency label matching FREQUENCY_LABELS (e.g. '1 kHz')
@@ -345,11 +354,11 @@ def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> tuple[
     Returns (df, out_csv).
     """
     sample_rate, audio_data = _load_audio(wav_path)
-    print(f"  Sample rate : {sample_rate} Hz")
-    print(f"  Duration    : {len(audio_data) / sample_rate:.2f} s")
 
     center_freqs = _get_third_octave_frequencies()
-    print(f"  Analysing {len(center_freqs)} third-octave bands...")
+    min_freq = center_freqs[0]
+    max_freq = MAX_FREQ_RATIO * sample_rate
+    print(f"  Analysing {len(center_freqs)} third-octave bands (up to {max_freq:.0f} Hz)...")
 
     # Use FREQUENCY_LABELS so labels match the plot's frequency_index exactly.
     # FREQUENCY_LABELS has 33 entries (12.5 Hz … 20 kHz), same order as center_freqs.
@@ -358,18 +367,22 @@ def wav_to_dataframe(wav_path: Path, calibration_offset: float = 20.0) -> tuple[
     col_name = f"LAeq [dB] - {wav_path.stem}"
     rows = []
     for label, freq in zip(freq_labels, center_freqs):
-        filtered = _third_octave_filter(audio_data, sample_rate, freq)
-        a_weighted = _apply_a_weighting(filtered, sample_rate)
-        if np.all(filtered == 0):
+        if freq < min_freq or freq > max_freq:
             spl = float('nan')
         else:
-            spl = _calculate_spl(a_weighted, offset_db=calibration_offset)
+            filtered = design_third_octave_filter(audio_data, sample_rate, freq)
+            a_weighted = _apply_a_weighting(filtered, sample_rate)
+            if np.all(filtered == 0):
+                spl = float('nan')
+            else:
+                spl = calculate_spl_db20upa(a_weighted, calibration_offset=calibration_offset)
         rows.append({"level": label, col_name: spl})
 
     df = pd.DataFrame(rows)
 
     # Save CSV to wav2csv/
     WAV2CSV_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_csv = WAV2CSV_DIR / f"{wav_path.stem}_{timestamp}.csv"
     df.rename(columns={"level": "Frequency"}).to_csv(out_csv, index=False)
